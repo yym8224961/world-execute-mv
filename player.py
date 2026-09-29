@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""A terminal music video. Python standard library + macOS AVFoundation."""
+"""A terminal music video. Python standard library + macOS AVFoundation / Windows MCI."""
 from __future__ import annotations
 import argparse, bisect, json, math, os, select, shutil, signal, subprocess
-import sys, termios, threading, time, tty, unicodedata
+import sys, threading, time, unicodedata
 from pathlib import Path
+
+IS_WIN = sys.platform == 'win32'
+if IS_WIN:
+    import ctypes, msvcrt
+    from ctypes import wintypes
+else:
+    import termios, tty
 
 ROOT = Path(__file__).resolve().parent
 TAU = math.tau
@@ -112,10 +119,11 @@ CHAPTERS=[(0,'01 / CREATION','创建'),(29.709,'02 / DEVOTION','献出自我'),
 
 class Film:
     def __init__(self):
-        self.lyrics=json.loads((ROOT/'lyrics.json').read_text())
+        # Data files are UTF-8; never fall back to the locale codec (GBK on Chinese Windows).
+        self.lyrics=json.loads((ROOT/'lyrics.json').read_text(encoding='utf-8'))
         self.times=[x['time'] for x in self.lyrics]
-        self.spectrum=json.loads((ROOT/'spectrum.json').read_text())
-        self.config=json.loads((ROOT/'config.json').read_text())
+        self.spectrum=json.loads((ROOT/'spectrum.json').read_text(encoding='utf-8'))
+        self.config=json.loads((ROOT/'config.json').read_text(encoding='utf-8'))
     def cue(self,t):
         idx=bisect.bisect_right(self.times,t)-1
         e=self.lyrics[idx] if idx>=0 else None
@@ -198,7 +206,8 @@ class Audio:
     def __init__(self,path):
         self.state={'time':0.,'duration':0.,'playing':False}
         self.last=time.monotonic(); self.error=''
-        self.proc=subprocess.Popen([str(ROOT/'audio-clock'),str(path)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
+        command=[sys.executable,str(ROOT/'audio_clock_win.py'),str(path)] if IS_WIN else [str(ROOT/'audio-clock'),str(path)]
+        self.proc=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',bufsize=1)
         threading.Thread(target=self.read,daemon=True).start()
         deadline=time.monotonic()+8
         while not self.state['duration']:
@@ -219,24 +228,60 @@ class Audio:
             try:self.command('quit');self.proc.wait(timeout=2)
             except (BrokenPipeError,subprocess.TimeoutExpired):self.proc.terminate()
 
+def setup_windows_console():
+    # Enable VT escapes and UTF-8 on the real console, even when stdout is piped.
+    kernel32=ctypes.windll.kernel32
+    kernel32.SetConsoleOutputCP(65001)
+    if not sys.stdout.isatty():
+        sys.stdout=os.fdopen(os.open('CONOUT$',os.O_WRONLY),'w',encoding='utf-8',buffering=1)
+    handle=kernel32.CreateFileW('CONOUT$',0xC0000000,0x7,None,3,0,None)
+    mode=wintypes.DWORD()
+    if handle!=-1 and kernel32.GetConsoleMode(handle,ctypes.byref(mode)):
+        kernel32.SetConsoleMode(handle,mode.value|0x0004|0x0008)
+    kernel32.CloseHandle(handle)
+    try:sys.stdout.reconfigure(encoding='utf-8',errors='replace',line_buffering=True)
+    except Exception:pass
+
+class _ConsoleRect(ctypes.Structure):
+    _fields_=[('left',ctypes.c_short),('top',ctypes.c_short),('right',ctypes.c_short),('bottom',ctypes.c_short)]
+
+class _ConsoleInfo(ctypes.Structure):
+    class _Coord(ctypes.Structure):
+        _fields_=[('x',ctypes.c_short),('y',ctypes.c_short)]
+    _fields_=[('size',_Coord),('cursor',_Coord),('attr',wintypes.WORD),('window',_ConsoleRect),('max',_Coord)]
+
+def windows_terminal_size():
+    # os.get_terminal_size(stdin fd) fails on Windows; read the visible window from CONOUT$.
+    kernel32=ctypes.windll.kernel32
+    handle=kernel32.CreateFileW('CONOUT$',0xC0000000,0x3,None,3,0,None)
+    info=_ConsoleInfo()
+    try:
+        if handle==-1 or not kernel32.GetConsoleScreenBufferInfo(handle,ctypes.byref(info)):raise OSError('no console')
+        return info.window.right-info.window.left+1,info.window.bottom-info.window.top+1
+    finally:
+        if handle!=-1:kernel32.CloseHandle(handle)
+
 def run(args,film):
-    if not sys.stdin.isatty():raise RuntimeError('请在 macOS 终端中运行。')
-    # Write to the controlling terminal even when a command wrapper pipes stdout.
-    terminal_fd=os.open('/dev/tty',os.O_RDWR)
-    sys.stdout=os.fdopen(os.dup(terminal_fd),'w',encoding='utf-8',buffering=1)
-    os.close(terminal_fd)
+    if not sys.stdin.isatty():raise RuntimeError('请在真实终端窗口中运行。')
+    if IS_WIN:setup_windows_console()
+    else:
+        # Write to the controlling terminal even when a command wrapper pipes stdout.
+        terminal_fd=os.open('/dev/tty',os.O_RDWR)
+        sys.stdout=os.fdopen(os.dup(terminal_fd),'w',encoding='utf-8',buffering=1)
+        os.close(terminal_fd)
     audio_path=Path(args.audio).expanduser().resolve() if args.audio else Path(film.config['audio'])
     if not args.audio and not audio_path.is_absolute():audio_path=ROOT/audio_path
     if not audio_path.is_file():raise RuntimeError(f'找不到音频：{audio_path}\n请使用 --audio 指定 MP3 文件。')
     audio=Audio(audio_path)
-    original=termios.tcgetattr(sys.stdin.fileno())
+    original=None if IS_WIN else termios.tcgetattr(sys.stdin.fileno())
     offset=args.offset if args.offset is not None else film.config.get('subtitle_offset',0.)
     started=args.autoplay or args.paused; paused=not args.autoplay; help_on=False; volume=.75; ready=not started
     current=args.start; playing_seen=False; frames=0; max_render=0.; size_last=None; report=[]
     def quit_signal(*_):raise KeyboardInterrupt
-    old_signals={s:signal.signal(s,quit_signal) for s in (signal.SIGTERM,signal.SIGHUP)}
+    signals=(signal.SIGTERM,) if IS_WIN else (signal.SIGTERM,signal.SIGHUP)
+    old_signals={s:signal.signal(s,quit_signal) for s in signals}
     try:
-        tty.setcbreak(sys.stdin.fileno())
+        if not IS_WIN:tty.setcbreak(sys.stdin.fileno())
         sys.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J');sys.stdout.flush()
         audio.command(f'seek {args.start}')
         if args.autoplay:audio.command('play')
@@ -244,7 +289,7 @@ def run(args,film):
         while True:
             begin=time.monotonic()
             state=audio.state.copy();current=state['time']
-            if audio.error:raise RuntimeError('音频输出不可用，请检查 macOS 声音输出设备。')
+            if audio.error:raise RuntimeError('音频输出不可用，请检查系统声音输出设备。')
             if audio.proc.poll() is not None:raise RuntimeError('音频引擎意外退出。')
             if begin-audio.last>2:raise RuntimeError('音频时钟停止更新。')
             if state['playing']:playing_seen=True
@@ -253,7 +298,7 @@ def run(args,film):
                 audio.command(f'seek {state["duration"]-.02}')
             if current>=state['duration']-.05 and not state['playing'] and started:paused=True
             # Read the PTY itself. Shell COLUMNS/LINES can be stale after fullscreen.
-            try:w,h=os.get_terminal_size(sys.stdin.fileno())
+            try:w,h=windows_terminal_size() if IS_WIN else os.get_terminal_size(sys.stdin.fileno())
             except OSError:w,h=100,36
             w=min(w,240);h=min(h,85)
             # Leave the last column unused. This avoids terminal autowrap artifacts.
@@ -266,42 +311,56 @@ def run(args,film):
             next_frame+=1/args.fps
             delay=max(0,next_frame-time.monotonic())
             if delay==0:next_frame=time.monotonic()
-            if select.select([sys.stdin],[],[],delay)[0]:
+            if IS_WIN:
+                # No select() on stdin: poll the console and pace the frame manually.
+                deadline=time.monotonic()+delay
+                while True:
+                    if msvcrt.kbhit():
+                        ch=msvcrt.getwch()
+                        if ch in ('\x00','\xe0'):
+                            # Map console key codes to the same escape sequences parsed below.
+                            keybuf+={'K':'\x1b[D','M':'\x1b[C','H':'\x1b[A','P':'\x1b[B'}.get(msvcrt.getwch(),'')
+                        else:keybuf+=ch
+                        continue
+                    remaining=deadline-time.monotonic()
+                    if remaining<=0:break
+                    time.sleep(min(.004,remaining))
+            elif select.select([sys.stdin],[],[],delay)[0]:
                 keybuf+=os.read(sys.stdin.fileno(),128).decode('utf-8',errors='ignore')
                 if keybuf=='\x1b':
                     if select.select([sys.stdin],[],[],.035)[0]:keybuf+=os.read(sys.stdin.fileno(),32).decode(errors='ignore')
-                while keybuf:
-                    if keybuf.startswith(('\x1b[C','\x1b[D')):
-                        right=keybuf[2]=='C';keybuf=keybuf[3:]
-                        audio.command(f'seek {min(state["duration"]-.05,max(0,current+(5 if right else -5)))}')
-                    else:
-                        key=keybuf[0];keybuf=keybuf[1:]
-                        if key in ('q','Q','\x1b','\x03'):return
-                        if key in (' ','\r','\n'):
-                            if not started:started=True;ready=False;paused=False;audio.command('play')
-                            else:paused=not paused;audio.command('pause' if paused else 'play')
-                        elif key in ('r','R'):
-                            audio.command('seek 0');audio.command('play');started=True;ready=False;paused=False
-                        elif key in '12345':
-                            audio.command(f'seek {CHAPTERS[int(key)-1][0]}');audio.command('play');started=True;ready=False;paused=False
-                        elif key=='[':offset=round(offset+.1,2)
-                        elif key==']':offset=round(offset-.1,2)
-                        elif key in ',.':
-                            i=bisect.bisect_right(film.times,current+.03)-1
-                            i=min(len(film.times)-1,max(0,i+(1 if key=='.' else -1)))
-                            audio.command(f'seek {film.times[i]}');started=True;ready=False
-                        elif key in 'hH':help_on=not help_on
-                        elif key in '+=':volume=min(1,volume+.05);audio.command(f'volume {volume}')
-                        elif key=='-':volume=max(0,volume-.05);audio.command(f'volume {volume}')
+            while keybuf:
+                if keybuf.startswith(('\x1b[C','\x1b[D')):
+                    right=keybuf[2]=='C';keybuf=keybuf[3:]
+                    audio.command(f'seek {min(state["duration"]-.05,max(0,current+(5 if right else -5)))}')
+                else:
+                    key=keybuf[0];keybuf=keybuf[1:]
+                    if key in ('q','Q','\x1b','\x03'):return
+                    if key in (' ','\r','\n'):
+                        if not started:started=True;ready=False;paused=False;audio.command('play')
+                        else:paused=not paused;audio.command('pause' if paused else 'play')
+                    elif key in ('r','R'):
+                        audio.command('seek 0');audio.command('play');started=True;ready=False;paused=False
+                    elif key in '12345':
+                        audio.command(f'seek {CHAPTERS[int(key)-1][0]}');audio.command('play');started=True;ready=False;paused=False
+                    elif key=='[':offset=round(offset+.1,2)
+                    elif key==']':offset=round(offset-.1,2)
+                    elif key in ',.':
+                        i=bisect.bisect_right(film.times,current+.03)-1
+                        i=min(len(film.times)-1,max(0,i+(1 if key=='.' else -1)))
+                        audio.command(f'seek {film.times[i]}');started=True;ready=False
+                    elif key in 'hH':help_on=not help_on
+                    elif key in '+=':volume=min(1,volume+.05);audio.command(f'volume {volume}')
+                    elif key=='-':volume=max(0,volume-.05);audio.command(f'volume {volume}')
     finally:
         audio.close()
-        termios.tcsetattr(sys.stdin.fileno(),termios.TCSADRAIN,original)
+        if not IS_WIN:termios.tcsetattr(sys.stdin.fileno(),termios.TCSADRAIN,original)
         sys.stdout.write('\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l');sys.stdout.flush()
         for s,handler in old_signals.items():signal.signal(s,handler)
         if args.report:
-            Path(args.report).write_text(json.dumps({'frames':frames,'last_time':current,'max_frame_render_seconds':max_render,'samples':report},indent=2))
+            Path(args.report).write_text(json.dumps({'frames':frames,'last_time':current,'max_frame_render_seconds':max_render,'samples':report},indent=2),encoding='utf-8')
 
-def main():
+def build_arg_parser():
     p=argparse.ArgumentParser(description='world.execute(me); / bilingual terminal MV')
     p.add_argument('--audio');p.add_argument('--start',type=float,default=0.)
     p.add_argument('--autoplay',action='store_true');p.add_argument('--fps',type=int,default=24)
@@ -309,7 +368,10 @@ def main():
     p.add_argument('--offset',type=float);p.add_argument('--snapshot',type=float)
     p.add_argument('--width',type=int,default=120);p.add_argument('--height',type=int,default=40)
     p.add_argument('--plain',action='store_true');p.add_argument('--report');p.add_argument('--stop-after',type=float)
-    a=p.parse_args();film=Film()
+    return p
+
+def main():
+    p=build_arg_parser();a=p.parse_args();film=Film()
     if not 5<=a.fps<=60:p.error('--fps must be between 5 and 60')
     if a.snapshot is not None:
         c=film.render(a.snapshot,a.width,a.height,True)

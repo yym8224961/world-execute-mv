@@ -1,0 +1,6 @@
+[project]
+name = "world-execute-me-ascii"
+version = "1.0.0"
+description = "Mili《world.execute(me);》的终端字符动画播放器(macOS / Windows)"
+requires-python = ">=3.9"
+dependencies = []

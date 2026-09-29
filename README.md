@@ -40,6 +40,8 @@ python3 world-execute-mv.pyz --start 158.7 --autoplay
 
 仓库不保存音频文件。从源码运行或重新打包前，请将自己的音频放到本地 `media/song.mp3`。使用 Release 播放包无需此步骤。
 
+### macOS
+
 首次构建音频组件需要 Apple Command Line Tools（含 Swift 编译器）：
 
 ```sh
@@ -53,6 +55,16 @@ xcode-select --install
 ```
 
 启动脚本在缺少 `audio-clock` 时自动编译本机架构。双击 `播放MV.command` 可在 macOS 系统终端中运行源码版。
+
+### Windows
+
+需要 Windows 10 1809+ 与 [uv](https://docs.astral.sh/uv/)。依赖管理由 uv 完成，播放器本身仍只用 Python 标准库，音频走系统自带的 MCI 引擎（`audio_clock_win.py`，与 macOS 音频组件同一套进程协议）：
+
+```sh
+uv run player.py
+```
+
+建议使用 Windows Terminal，窗口至少 128 列 × 44 行。按键操作与 macOS 完全一致。运行 `uv run python tests/test_win_smoke.py` 可执行 Windows 冒烟测试（会短暂播放一段很轻的测试音）。
 
 ## 重新打包
 
