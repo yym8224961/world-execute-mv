@@ -28,7 +28,7 @@ def main():
             target.write_bytes(data)
             manifest['files'][name] = hashlib.sha256(data).hexdigest()
         (stage/'__main__.py').write_bytes((ROOT/'tools/bundle_main.py').read_bytes())
-        (stage/'bundle-manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+        (stage/'bundle-manifest.json').write_text(json.dumps(manifest, indent=2)+'\n', encoding='utf-8')
         package = output/'world-execute-mv.pyz'
         zipapp.create_archive(stage, package, interpreter='/usr/bin/env python3', compressed=True)
         package.chmod(0o755)
@@ -40,7 +40,7 @@ def main():
             archive.write(path, 'world-execute-mv/'+name)
     paths = [package, output/'world-execute-mv-macos.zip']
     (output/'SHA256SUMS.txt').write_text(''.join(
-        hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in paths))
+        hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in paths), encoding='utf-8')
     print(json.dumps({'artifacts': [str(p) for p in paths], 'embedded_audio': True}, ensure_ascii=False))
 
 
